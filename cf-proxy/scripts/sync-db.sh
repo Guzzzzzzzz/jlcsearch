@@ -1,13 +1,64 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-# Sync SQLite database to Cloudflare D1
-# By default this uses the local workspace database.
-# Set SOURCE_DB_PATH to override, or set DATABASE_DOWNLOAD_TOKEN to pull from Fly.
+# Sync a prepared SQLite database into Cloudflare D1.
+# The script works from a copied temp DB so it can safely rebuild derived tables
+# before exporting them.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TEMP_DIR="${SCRIPT_DIR}/../.db-sync-temp"
-DEFAULT_LOCAL_DB="${SCRIPT_DIR}/../../db.sqlite3"
+DEFAULT_LOCAL_DB="${REPO_ROOT}/db.sqlite3"
+DB_NAME="${DB_NAME:-jlcsearch}"
+BATCH_ROWS="${BATCH_ROWS:-250}"
+COMPONENT_CATALOG_BATCH_ROWS="${COMPONENT_CATALOG_BATCH_ROWS:-${BATCH_ROWS}}"
+SEARCH_INDEX_BATCH_ROWS="${SEARCH_INDEX_BATCH_ROWS:-${BATCH_ROWS}}"
+SYNC_DERIVED_TABLES="${SYNC_DERIVED_TABLES:-1}"
+SYNC_COMPONENT_CATALOG="${SYNC_COMPONENT_CATALOG:-0}"
+SYNC_SEARCH_INDEX="${SYNC_SEARCH_INDEX:-0}"
+DERIVED_TABLES_LIST="${DERIVED_TABLES_LIST:-}"
+
+DERIVED_TABLES=(
+  accelerometer
+  adc
+  analog_multiplexer
+  battery_holder
+  bjt_transistor
+  boost_converter
+  buck_boost_converter
+  capacitor
+  dac
+  diode
+  fpc_connector
+  fpga
+  fuse
+  gas_sensor
+  gyroscope
+  header
+  io_expander
+  jst_connector
+  lcd_display
+  ldo
+  led
+  led_dot_matrix_display
+  led_driver
+  led_segment_display
+  led_with_ic
+  microcontroller
+  mosfet
+  oled_display
+  pcie_m2_connector
+  potentiometer
+  relay
+  resistor
+  resistor_array
+  switch
+  usb_c_connector
+  voltage_regulator
+  wifi_module
+  wire_to_board_connector
+)
+ACTIVE_DERIVED_TABLES=("${DERIVED_TABLES[@]}")
 
 if command -v bunx >/dev/null 2>&1; then
   WRANGLER_CMD=(bunx wrangler)
@@ -19,42 +70,172 @@ run_wrangler() {
   "${WRANGLER_CMD[@]}" "$@"
 }
 
-echo "Creating temp directory..."
-mkdir -p "$TEMP_DIR"
-cd "$TEMP_DIR"
+cleanup() {
+  cd "$SCRIPT_DIR"
+  if [[ "${KEEP_SYNC_TEMP:-0}" != "1" ]]; then
+    rm -rf "$TEMP_DIR"
+  fi
+}
 
-if [ -n "${SOURCE_DB_PATH}" ]; then
-  echo "Copying database from SOURCE_DB_PATH=${SOURCE_DB_PATH}..."
-  cp "${SOURCE_DB_PATH}" db.sqlite3
-elif [ -f "${DEFAULT_LOCAL_DB}" ]; then
-  echo "Copying local database from ${DEFAULT_LOCAL_DB}..."
-  cp "${DEFAULT_LOCAL_DB}" db.sqlite3
-elif [ -n "${DATABASE_DOWNLOAD_TOKEN}" ]; then
-  echo "Downloading database from Fly..."
-  curl -f -o db.sqlite3 "https://jlcsearch.fly.dev/database/${DATABASE_DOWNLOAD_TOKEN}"
-else
-  echo "No database source available."
-  echo "Set SOURCE_DB_PATH, ensure ${DEFAULT_LOCAL_DB} exists, or set DATABASE_DOWNLOAD_TOKEN."
-  exit 1
-fi
+trap cleanup EXIT
 
-echo "Database size: $(du -h db.sqlite3 | cut -f1)"
+require_command() {
+  local command_name="$1"
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    echo "Required command '$command_name' is not installed."
+    exit 1
+  fi
+}
 
-# List all tables (excluding FTS virtual tables and internal tables)
-echo "Extracting derived tables..."
-TABLES=$(sqlite3 db.sqlite3 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'components_fts%' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('components', 'component_catalog', 'search_index') ORDER BY name;")
+table_exists() {
+  local table="$1"
+  sqlite3 db.sqlite3 \
+    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='${table}');"
+}
 
-# Create schema and data dump (excluding FTS tables)
-echo "Creating SQL dump..."
-sqlite3 db.sqlite3 << 'SCHEMA_EOF' > schema.sql
-SELECT 'DROP TABLE IF EXISTS "' || name || '";' FROM sqlite_master
-WHERE type='table'
-AND name NOT LIKE 'components_fts%'
-AND name NOT LIKE 'sqlite_%'
-AND name NOT IN ('components', 'component_catalog', 'search_index');
-SCHEMA_EOF
+require_table() {
+  local table="$1"
+  if [[ "$(table_exists "$table")" != "1" ]]; then
+    echo "Expected table '$table' to exist in the source database."
+    exit 1
+  fi
+}
 
-cat > cleanup_obsolete_objects.sql <<'CLEANUP_EOF'
+select_derived_tables() {
+  if [[ -z "${DERIVED_TABLES_LIST}" ]]; then
+    ACTIVE_DERIVED_TABLES=("${DERIVED_TABLES[@]}")
+    return
+  fi
+
+  local requested raw_table normalized found
+  local filtered=()
+  IFS=',' read -r -a requested <<< "${DERIVED_TABLES_LIST}"
+
+  for raw_table in "${requested[@]}"; do
+    normalized="$(echo "${raw_table}" | xargs)"
+    if [[ -z "${normalized}" ]]; then
+      continue
+    fi
+
+    found=0
+    for table in "${DERIVED_TABLES[@]}"; do
+      if [[ "${table}" == "${normalized}" ]]; then
+        filtered+=("${table}")
+        found=1
+        break
+      fi
+    done
+
+    if [[ "${found}" != "1" ]]; then
+      echo "Unknown derived table '${normalized}' in DERIVED_TABLES_LIST."
+      exit 1
+    fi
+  done
+
+  if [[ "${#filtered[@]}" -eq 0 ]]; then
+    echo "DERIVED_TABLES_LIST did not resolve to any derived tables."
+    exit 1
+  fi
+
+  ACTIVE_DERIVED_TABLES=("${filtered[@]}")
+}
+
+copy_source_db() {
+  rm -rf "$TEMP_DIR"
+  mkdir -p "$TEMP_DIR"
+  cd "$TEMP_DIR"
+
+  if [[ -n "${SOURCE_DB_PATH:-}" ]]; then
+    echo "Copying database from SOURCE_DB_PATH=${SOURCE_DB_PATH}..."
+    cp "${SOURCE_DB_PATH}" db.sqlite3
+  elif [[ -f "${DEFAULT_LOCAL_DB}" ]]; then
+    echo "Copying local database from ${DEFAULT_LOCAL_DB}..."
+    cp "${DEFAULT_LOCAL_DB}" db.sqlite3
+  elif [[ -n "${DATABASE_DOWNLOAD_TOKEN:-}" ]]; then
+    echo "DATABASE_DOWNLOAD_TOKEN/Fly fallback is no longer supported."
+    echo "Use SOURCE_DB_PATH or ensure ${DEFAULT_LOCAL_DB} exists."
+    exit 1
+  else
+    echo "No database source available."
+    echo "Set SOURCE_DB_PATH or ensure ${DEFAULT_LOCAL_DB} exists."
+    exit 1
+  fi
+
+  echo "Database size: $(du -h db.sqlite3 | cut -f1)"
+}
+
+rebuild_derived_tables() {
+  echo "Rebuilding derived tables in temp database..."
+  if [[ "${#ACTIVE_DERIVED_TABLES[@]}" -eq "${#DERIVED_TABLES[@]}" ]]; then
+    (
+      cd "$REPO_ROOT"
+      JLCSEARCH_DB_PATH="${TEMP_DIR}/db.sqlite3" bun run scripts/setup-derived-tables.ts --reset
+    )
+    return
+  fi
+
+  local table
+  for table in "${ACTIVE_DERIVED_TABLES[@]}"; do
+    (
+      cd "$REPO_ROOT"
+      JLCSEARCH_DB_PATH="${TEMP_DIR}/db.sqlite3" bun run scripts/setup-derived-tables.ts --reset "${table}"
+    )
+  done
+}
+
+create_derived_schema_dump() {
+  echo "Creating derived-table schema dump..."
+  : > schema.sql
+
+  for table in "${ACTIVE_DERIVED_TABLES[@]}"; do
+    require_table "$table"
+    printf 'DROP TABLE IF EXISTS "%s";\n' "$table" >> schema.sql
+    sqlite3 db.sqlite3 ".schema ${table}" >> schema.sql
+    printf '\n' >> schema.sql
+  done
+}
+
+import_table_in_batches() {
+  local table="$1"
+  local batch_size="$2"
+  local row_count offset batch_end chunk_file
+
+  require_table "$table"
+  row_count="$(sqlite3 db.sqlite3 "SELECT COUNT(*) FROM \"${table}\";")"
+
+  if [[ "${row_count}" == "0" ]]; then
+    echo "Skipping ${table}: source table is empty."
+    return
+  fi
+
+  echo "Importing ${table} (${row_count} rows, batch size ${batch_size})..."
+  chunk_file="${TEMP_DIR}/${table}.chunk.sql"
+
+  for ((offset=0; offset<row_count; offset+=batch_size)); do
+    batch_end=$((offset + batch_size))
+    if (( batch_end > row_count )); then
+      batch_end=${row_count}
+    fi
+
+    sqlite3 db.sqlite3 <<EOF > "${chunk_file}"
+.mode insert ${table}
+.output stdout
+SELECT * FROM "${table}" ORDER BY rowid LIMIT ${batch_size} OFFSET ${offset};
+EOF
+
+    if [[ ! -s "${chunk_file}" ]]; then
+      continue
+    fi
+
+    echo "  importing rows $((offset + 1))-${batch_end}"
+    run_wrangler d1 execute "${DB_NAME}" --remote --file="${chunk_file}"
+  done
+
+  rm -f "${chunk_file}"
+}
+
+write_cleanup_sql() {
+  cat > cleanup_obsolete_objects.sql <<'CLEANUP_EOF'
 DROP TRIGGER IF EXISTS components_ai;
 DROP TRIGGER IF EXISTS components_au;
 DROP TRIGGER IF EXISTS components_ad;
@@ -64,26 +245,11 @@ DROP TABLE IF EXISTS components_fts;
 DROP TABLE IF EXISTS components;
 DROP TABLE IF EXISTS search_index_old;
 CLEANUP_EOF
+}
 
-# Export schema for each table
-for table in $TABLES; do
-  echo "Exporting schema for $table..."
-  sqlite3 db.sqlite3 ".schema $table" >> schema.sql
-done
-
-# Export data for derived tables only (not the main components table which is huge)
-# The derived tables are the ones we query via D1
-DERIVED_TABLES="accelerometer adc analog_multiplexer battery_holder bjt_transistor boost_converter buck_boost_converter capacitor dac diode fpc_connector fpga fuse gas_sensor gyroscope header io_expander jst_connector lcd_display ldo led led_dot_matrix_display led_driver led_segment_display led_with_ic microcontroller mosfet oled_display pcie_m2_connector potentiometer relay resistor resistor_array switch usb_c_connector voltage_regulator wifi_module wire_to_board_connector"
-
-echo "Creating data dump for derived tables..."
-rm -f data.sql
-for table in $DERIVED_TABLES; do
-  echo "Exporting data for $table..."
-  sqlite3 db.sqlite3 ".mode insert $table" ".output stdout" "SELECT * FROM $table;" >> data.sql 2>/dev/null || echo "-- Table $table not found, skipping" >> data.sql
-done
-
-echo "Materializing component catalog locally..."
-sqlite3 db.sqlite3 <<'COMPONENT_CATALOG_SCHEMA'
+materialize_component_catalog() {
+  echo "Materializing component catalog locally..."
+  sqlite3 db.sqlite3 <<'COMPONENT_CATALOG_SCHEMA'
 DROP TABLE IF EXISTS component_catalog;
 CREATE TABLE component_catalog AS
 SELECT
@@ -107,8 +273,7 @@ CREATE INDEX IF NOT EXISTS idx_component_catalog_preferred ON component_catalog(
 CREATE INDEX IF NOT EXISTS idx_component_catalog_stock ON component_catalog(stock DESC);
 COMPONENT_CATALOG_SCHEMA
 
-echo "Exporting component catalog SQL..."
-cat > component_catalog_schema.sql <<'COMPONENT_CATALOG_SCHEMA_EXPORT'
+  cat > component_catalog_schema.sql <<'COMPONENT_CATALOG_SCHEMA_EXPORT'
 DROP TABLE IF EXISTS component_catalog;
 CREATE TABLE component_catalog (
   lcsc INTEGER,
@@ -129,11 +294,11 @@ CREATE INDEX IF NOT EXISTS idx_component_catalog_basic ON component_catalog(basi
 CREATE INDEX IF NOT EXISTS idx_component_catalog_preferred ON component_catalog(preferred);
 CREATE INDEX IF NOT EXISTS idx_component_catalog_stock ON component_catalog(stock DESC);
 COMPONENT_CATALOG_SCHEMA_EXPORT
+}
 
-sqlite3 db.sqlite3 ".mode insert component_catalog" ".output component_catalog_data.sql" "SELECT * FROM component_catalog;"
-
-echo "Materializing search index locally..."
-sqlite3 db.sqlite3 <<'SEARCH_INDEX_SCHEMA'
+materialize_search_index() {
+  echo "Materializing search index locally..."
+  sqlite3 db.sqlite3 <<'SEARCH_INDEX_SCHEMA'
 DROP TABLE IF EXISTS search_index;
 CREATE TABLE search_index AS
 SELECT
@@ -188,8 +353,7 @@ CREATE INDEX IF NOT EXISTS idx_search_index_basic ON search_index(basic);
 CREATE INDEX IF NOT EXISTS idx_search_index_preferred ON search_index(preferred);
 SEARCH_INDEX_SCHEMA
 
-echo "Exporting search index SQL..."
-cat > search_index_schema.sql <<'SEARCH_INDEX_SCHEMA_EXPORT'
+  cat > search_index_schema.sql <<'SEARCH_INDEX_SCHEMA_EXPORT'
 DROP TABLE IF EXISTS search_index;
 CREATE TABLE search_index (
   lcsc INTEGER,
@@ -215,52 +379,59 @@ CREATE INDEX IF NOT EXISTS idx_search_index_package ON search_index(package);
 CREATE INDEX IF NOT EXISTS idx_search_index_basic ON search_index(basic);
 CREATE INDEX IF NOT EXISTS idx_search_index_preferred ON search_index(preferred);
 SEARCH_INDEX_SCHEMA_EXPORT
+}
 
-sqlite3 db.sqlite3 ".mode insert search_index" ".output search_index_data.sql" "SELECT * FROM search_index;"
+main() {
+  require_command bun
+  require_command sqlite3
 
-echo "Importing schema to D1..."
-run_wrangler d1 execute jlcsearch --remote --file=cleanup_obsolete_objects.sql
-run_wrangler d1 execute jlcsearch --remote --file=schema.sql
+  if [[ "${SYNC_DERIVED_TABLES}" != "1" && "${SYNC_COMPONENT_CATALOG}" != "1" && "${SYNC_SEARCH_INDEX}" != "1" ]]; then
+    echo "Nothing to sync. Enable at least one of SYNC_DERIVED_TABLES=1, SYNC_COMPONENT_CATALOG=1, or SYNC_SEARCH_INDEX=1."
+    exit 1
+  fi
 
-echo "Importing data to D1..."
-# Split data.sql into chunks if needed (D1 has query limits)
-split -l 1000 data.sql data_chunk_
+  copy_source_db
+  select_derived_tables
 
-for chunk in data_chunk_*; do
-  echo "Importing $chunk..."
-  run_wrangler d1 execute jlcsearch --remote --file="$chunk" || echo "Warning: Some inserts in $chunk may have failed"
-done
+  if [[ "${SYNC_DERIVED_TABLES}" == "1" ]]; then
+    rebuild_derived_tables
+    create_derived_schema_dump
 
-echo "Importing search index schema to D1..."
-run_wrangler d1 execute jlcsearch --remote --file=search_index_schema.sql
+    echo "Importing derived-table schema to D1..."
+    run_wrangler d1 execute "${DB_NAME}" --remote --file=schema.sql
 
-echo "Importing search index data to D1..."
-split -l 1000 search_index_data.sql search_index_chunk_
+    for table in "${ACTIVE_DERIVED_TABLES[@]}"; do
+      import_table_in_batches "${table}" "${BATCH_ROWS}"
+    done
+  fi
 
-for chunk in search_index_chunk_*; do
-  echo "Importing $chunk..."
-  run_wrangler d1 execute jlcsearch --remote --file="$chunk" || echo "Warning: Some inserts in $chunk may have failed"
-done
+  if [[ "${SYNC_COMPONENT_CATALOG}" == "1" || "${SYNC_SEARCH_INDEX}" == "1" ]]; then
+    write_cleanup_sql
+    materialize_component_catalog
 
-echo "Importing component catalog schema to D1..."
-run_wrangler d1 execute jlcsearch --remote --file=component_catalog_schema.sql
+    echo "Importing cleanup SQL to D1..."
+    run_wrangler d1 execute "${DB_NAME}" --remote --file=cleanup_obsolete_objects.sql
+  fi
 
-echo "Importing component catalog data to D1..."
-split -l 1000 component_catalog_data.sql component_catalog_chunk_
+  if [[ "${SYNC_COMPONENT_CATALOG}" == "1" ]]; then
+    echo "Importing component catalog schema to D1..."
+    run_wrangler d1 execute "${DB_NAME}" --remote --file=component_catalog_schema.sql
+    import_table_in_batches component_catalog "${COMPONENT_CATALOG_BATCH_ROWS}"
+  fi
 
-for chunk in component_catalog_chunk_*; do
-  echo "Importing $chunk..."
-  run_wrangler d1 execute jlcsearch --remote --file="$chunk" || echo "Warning: Some inserts in $chunk may have failed"
-done
+  if [[ "${SYNC_SEARCH_INDEX}" == "1" ]]; then
+    materialize_search_index
+    echo "Importing search index schema to D1..."
+    run_wrangler d1 execute "${DB_NAME}" --remote --file=search_index_schema.sql
+    import_table_in_batches search_index "${SEARCH_INDEX_BATCH_ROWS}"
+  fi
 
-# Optional: Setup FTS5 if needed
-if [ -f "${SCRIPT_DIR}/setup-fts5.sql" ]; then
-  echo "Setting up FTS5..."
-  run_wrangler d1 execute jlcsearch --remote --file="${SCRIPT_DIR}/setup-fts5.sql" || echo "Warning: FTS5 setup failed (may not be needed for D1)"
-fi
+  if [[ -f "${SCRIPT_DIR}/setup-fts5.sql" ]]; then
+    echo "Setting up FTS5..."
+    run_wrangler d1 execute "${DB_NAME}" --remote --file="${SCRIPT_DIR}/setup-fts5.sql"
+  fi
 
-echo "Cleaning up..."
-cd "$SCRIPT_DIR"
-rm -rf "$TEMP_DIR"
+  echo "Sync complete!"
+}
 
-echo "Sync complete!"
+main "$@"

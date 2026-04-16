@@ -47,6 +47,16 @@ const getDatabaseCtor = (): typeof BunDatabase => {
   return DatabaseCtor
 }
 
+const DEFAULT_DB_PATH = Path.join(import.meta.dir, "../../db.sqlite3")
+
+export const getResolvedDbPath = (): string => {
+  const configuredPath = process.env.JLCSEARCH_DB_PATH?.trim()
+  if (!configuredPath) return DEFAULT_DB_PATH
+  return Path.isAbsolute(configuredPath)
+    ? configuredPath
+    : Path.resolve(process.cwd(), configuredPath)
+}
+
 export const getDbClient = () => {
   if (dbClientSingleton) {
     return dbClientSingleton
@@ -66,7 +76,7 @@ export const getDbClient = () => {
 
   dbClientSingleton = new KyselyCtorRef<DB>({
     dialect: new BunSqliteDialectRef({
-      database: new Database(Path.join(import.meta.dir, "../../db.sqlite3")),
+      database: new Database(getResolvedDbPath()),
     }),
   })
 
@@ -75,5 +85,5 @@ export const getDbClient = () => {
 
 export const getBunDatabaseClient = () => {
   const Database = getDatabaseCtor()
-  return new Database(Path.join(import.meta.dir, "../../db.sqlite3"))
+  return new Database(getResolvedDbPath())
 }
