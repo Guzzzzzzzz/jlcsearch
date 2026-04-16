@@ -38,9 +38,9 @@ test("getBunDatabaseClient respects JLCSEARCH_DB_PATH", () => {
   expect(getResolvedDbPath()).toBe(dbPath)
 
   const db = getBunDatabaseClient()
-  const row = db
-    .query("SELECT value FROM probe")
-    .get() as { value: string } | null
+  const row = db.query("SELECT value FROM probe").get() as {
+    value: string
+  } | null
 
   expect(row?.value).toBe("ok")
   db.close()

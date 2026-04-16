@@ -2,8 +2,7 @@ import type { Middleware } from "winterspec"
 
 const TWO_WEEKS_SECONDS = 14 * 24 * 60 * 60
 const ONE_MONTH_SECONDS = 30 * 24 * 60 * 60
-const STALE_WHILE_REVALIDATE_SECONDS =
-  ONE_MONTH_SECONDS - TWO_WEEKS_SECONDS
+const STALE_WHILE_REVALIDATE_SECONDS = ONE_MONTH_SECONDS - TWO_WEEKS_SECONDS
 
 export const withCacheHeaders: Middleware<{}, {}> = async (req, ctx, next) => {
   const res = await next(req, ctx)
