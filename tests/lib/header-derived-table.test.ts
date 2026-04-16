@@ -51,3 +51,53 @@ test("header table treats bend-insert headers as right angle", () => {
 
   expect(header?.is_right_angle).toBe(true)
 })
+
+test("header table treats Chinese bent-insert package text as right angle", () => {
+  const [header] = headerTableSpec.mapToTable([
+    makeComponent({
+      package: "弯插,P=2.54mm",
+      extra: JSON.stringify({
+        attributes: {
+          Pitch: "2.54mm",
+          "Number of Pins": "16P",
+          "Mounting Type": "Shrouded",
+        },
+      }),
+    }),
+  ])
+
+  expect(header?.is_right_angle).toBe(true)
+})
+
+test("header table treats horizontal SMD package text as right angle", () => {
+  const [header] = headerTableSpec.mapToTable([
+    makeComponent({
+      package: "SMD,P=2.54mm,卧贴",
+      extra: JSON.stringify({
+        attributes: {
+          Pitch: "2.54mm",
+          "Number of Pins": "16P",
+          "Mounting Type": "Surface Mount",
+        },
+      }),
+    }),
+  ])
+
+  expect(header?.is_right_angle).toBe(true)
+})
+
+test("header table treats brick nogging headers as right angle", () => {
+  const [header] = headerTableSpec.mapToTable([
+    makeComponent({
+      extra: JSON.stringify({
+        attributes: {
+          Pitch: "2.54mm",
+          "Number of Pins": "16P",
+          "Mounting Type": "Brick nogging",
+        },
+      }),
+    }),
+  ])
+
+  expect(header?.is_right_angle).toBe(true)
+})

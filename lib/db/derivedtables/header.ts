@@ -71,6 +71,7 @@ export const headerTableSpec: DerivedTableSpec<Header> = {
       const sourceSubcategory =
         (c as typeof c & { source_subcategory?: string | null })
           .source_subcategory ?? ""
+      const packageText = (c.package ?? "").toLowerCase()
       const searchableText = [c.description, c.mfr, extra.title]
         .filter((value): value is string => typeof value === "string")
         .join(" ")
@@ -193,12 +194,22 @@ export const headerTableSpec: DerivedTableSpec<Header> = {
       const mountingStyle =
         attrs["Mounting Style"] || attrs["Mounting Type"] || null
       const mountingStyleText = mountingStyle?.toLowerCase() ?? ""
-      const isRightAngle = Boolean(
-        mountingStyleText.includes("right") ||
-          mountingStyleText.includes("angle") ||
-          mountingStyleText.includes("bend") ||
-          searchableText.includes("right angle") ||
-          searchableText.includes("bend"),
+      const rightAngleHints = [
+        "right angle",
+        "right-angle",
+        "bend",
+        "brick nogging",
+        "horizontal attachment",
+        "side entry",
+        "弯插",
+        "卧贴",
+        "侧插",
+      ]
+      const isRightAngle = rightAngleHints.some(
+        (hint) =>
+          mountingStyleText.includes(hint) ||
+          packageText.includes(hint) ||
+          searchableText.includes(hint),
       )
 
       // Determine if shrouded
