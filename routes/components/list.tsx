@@ -52,7 +52,6 @@ export default withWinterSpec({
       "price",
       "extra",
       "basic",
-      "preferred",
     ])
     .limit(limit)
     .orderBy("stock", "desc")
