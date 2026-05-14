@@ -8,7 +8,7 @@ test("GET /components/list with json param returns component data", async () => 
   expect(Array.isArray(res.data.components)).toBe(true)
 })
 
-test("GET /components/list with is_extended_promotional filter returns components", async () => {
+test("GET /components/list with is_extended_promotional filter returns only extended promotional components", async () => {
   const { axios } = await getTestServer()
   const res = await axios.get(
     "/components/list?json=true&is_extended_promotional=true",
